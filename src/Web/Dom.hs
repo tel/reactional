@@ -12,6 +12,7 @@ module Web.Dom (
   , BoundingRect (..)
 
   , DomNode      (..)
+  , childElements, childTextNodes
   , DomEl        (..)
   , DomView      (..)
 
@@ -20,9 +21,10 @@ module Web.Dom (
 import           Control.Applicative
 import           Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
-import           Data.Text           (Text)
-import qualified Data.Text           as T
-import qualified Web.Dom.Static      as Static
+import           Data.Maybe (mapMaybe)
+import           Data.Text (Text)
+import qualified Data.Text as T
+import qualified Web.Dom.Static as Static
 import           Web.Dom.Types
 
 {-
@@ -35,10 +37,14 @@ import           Web.Dom.Types
 
 data NodeType = El | Tx
 
+class INodeType ty where
+  forgetNode :: Node r ty -> ANode r
+
+instance INodeType El where forgetNode = Left
+instance INodeType Tx where forgetNode = Right
+
 -- | A node of some, unknown type.
 type ANode r = Either (Node r El) (Node r Tx)
-
-
 
 -- | Instances of 'DomNode' provide an interface to a tree of "nodes"
 -- which are either branching (of type 'El') or terminal (of type
@@ -93,15 +99,41 @@ class Functor r => DomNode r where
 
   -- | Returns the node immediately preceding the specified one in its
   -- parent's childNodes list, or 'Nothing' if the specified node is
-  -- the last node in that list.
+  -- the first node in that list or has no parent.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.previousSibling>
-  previousSibling :: Node r a -> r (Maybe (ANode r))
+  previousSibling :: INodeType a => Node r a -> r (Maybe (ANode r))
+  default previousSibling
+    :: (Monad r, INodeType a) => Node r a -> r (Maybe (ANode r))
+  previousSibling n = do
+    mp   <- parentElement n
+    case mp of
+      Nothing -> return Nothing
+      Just p -> do
+        cs  <- childNodes p
+        cs' <- mapM (\c -> isEqualNode' (forgetNode n) c >>= \x -> return (c, not x)) cs
+        let t = takeWhile snd cs'
+        return $ case reverse t of
+          []        -> Nothing
+          ((x,_):_) -> Just x
 
   -- | Returns the node immediately following the specified one in its
   -- parent's childNodes list, or 'Nothing' if the specified node is
   -- the last node in that list.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.nextSibling>
-  nextSibling :: Node r a -> r (Maybe (ANode r))
+  nextSibling :: INodeType a => Node r a -> r (Maybe (ANode r))
+  default nextSibling
+    :: (Monad r, INodeType a) => Node r a -> r (Maybe (ANode r))
+  nextSibling n = do
+    mp   <- parentElement n
+    case mp of
+      Nothing -> return Nothing
+      Just p -> do
+        cs  <- childNodes p
+        cs' <- mapM (\c -> isEqualNode' (forgetNode n) c >>= \x -> return (c, not x)) cs
+        let t = dropWhile snd cs'
+        return $ case t of
+          []        -> Nothing
+          ((x,_):_) -> Just x
 
   -- | Returns or sets the value of the current node. Compare this
   -- with 'children'.
@@ -114,7 +146,7 @@ class Functor r => DomNode r where
   --
   -- Note that implementations in Javascript may need to consider
   -- @parentNode@ as well.
-  parentElement :: Node r a -> r (Maybe (Node r El))
+  parentElement :: INodeType a => Node r a -> r (Maybe (Node r El))
 
   -- | Adds a node to the end of the list of children of a specified
   -- parent node. If the node already exists it is removed from
@@ -137,9 +169,11 @@ class Functor r => DomNode r where
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.insertBefore>
   --
   -- > insertAfter parent reference target
-  insertAfter :: Node r El -> Node r a -> Node r b -> r (Either String ())
+  insertAfter :: (INodeType a, INodeType b) =>
+                 Node r El -> Node r a -> Node r b -> r (Either String ())
   default insertAfter
-    :: Monad r => Node r El -> Node r a -> Node r b -> r (Either String ())
+    :: (Monad r, INodeType a, INodeType b) =>
+       Node r El -> Node r a -> Node r b -> r (Either String ())
   insertAfter parent reference target = do
     next <- nextSibling reference
     case next of
@@ -150,7 +184,7 @@ class Functor r => DomNode r where
   -- | Returns a duplicate of the node on which this method was
   -- called. Children are not copied.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.cloneNode>
-  cloneNode :: Node r a -> r (Node r a)
+  cloneNode :: INodeType a => Node r a -> r (Node r a)
 
   -- | Returns a duplicate of the node on which this method was
   -- called. Children are copied as well.
@@ -168,7 +202,7 @@ class Functor r => DomNode r where
 
   -- | Tests whether two nodes are (reference) equal.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.isEqualNode>
-  isEqualNode :: Node r a -> Node r a -> r Bool
+  isEqualNode :: INodeType a => Node r a -> Node r a -> r Bool
 
   -- | Removes a child node from the DOM. Returns 'Left' if child not
   -- actually a child of the parent.
@@ -336,3 +370,19 @@ class DomEl r => DomView r where
   -- | Scrolls the element into view.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Element.scrollIntoView>
   scrollIntoView :: Node r El -> Position -> r ()
+
+childElements :: DomNode r => Node r El -> r [Node r El]
+childElements = fmap (mapMaybe goLeft) . childNodes where
+  goLeft (Left a) = Just a
+  goLeft _        = Nothing
+
+childTextNodes :: DomNode r => Node r El -> r [Node r Tx]
+childTextNodes = fmap (mapMaybe goRight) . childNodes where
+  goRight (Right a) = Just a
+  goRight _         = Nothing
+
+isEqualNode' :: (DomNode r, Monad r) => ANode r -> ANode r -> r Bool
+isEqualNode' (Left n1)  (Left n2)  = isEqualNode n1 n2
+isEqualNode' (Right n1) (Right n2) = isEqualNode n1 n2
+isEqualNode' _          _          = return False
+
