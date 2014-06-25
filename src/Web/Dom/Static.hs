@@ -13,6 +13,8 @@ module Web.Dom.Static (
 
 import           Control.Applicative
 import           Data.HashMap.Strict (HashMap)
+import           Data.Sequence       (Seq)
+import qualified Data.Sequence       as Seq
 import           Data.Text           (Text)
 import           Web.Dom.Types
 
@@ -33,14 +35,14 @@ attrs inj (Element t a) = (\a' -> Element t a') <$> inj a
 {-# INLINE attrs #-}
 
 data NodeF x
-  = El !Element [x]
+  = El !Element (Seq x)
   | Tx {-# UNPACK #-} !Text
   deriving ( Eq, Show, Functor )
 
 newtype Node = Node { unwrapNode :: NodeF Node }
 
 -- | Affine traversal
-children :: Applicative f => ([Node] -> f [Node]) -> Node -> f Node
+children :: Applicative f => (Seq Node -> f (Seq Node)) -> Node -> f Node
 children inj x = case unwrapNode x of
   El e cs -> Node . El e <$> inj cs
   _       -> pure x

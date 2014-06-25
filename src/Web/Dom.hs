@@ -1,12 +1,14 @@
 {-# LANGUAGE DataKinds           #-}
 {-# LANGUAGE GADTs               #-}
+{-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies        #-}
 
 module Web.Dom (
 
     NodeType     (..)
-  , ANode
+  , INodeType    (..)
+  , ANode, anyNode
   , Position     (..)
   , BoundingRect (..)
 
@@ -18,12 +20,16 @@ module Web.Dom (
   ) where
 
 import           Control.Applicative
-import           Control.Monad
+import           Control.Monad       hiding (mapM)
 import           Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
 import           Data.Maybe          (mapMaybe)
+import           Data.Sequence       (Seq, ViewL (..), ViewR (..))
+import qualified Data.Sequence       as Seq
 import           Data.Text           (Text)
 import qualified Data.Text           as T
+import           Data.Traversable    (mapM)
+import           Prelude             hiding (mapM)
 import qualified Web.Dom.Static      as Static
 import           Web.Dom.Types
 
@@ -45,6 +51,12 @@ instance INodeType Tx where forgetNode = Right
 
 -- | A node of some, unknown type.
 type ANode r = Either (Node r El) (Node r Tx)
+
+-- | Simple eliminator for 'ANode's
+anyNode :: (forall a . INodeType a => Node r a -> z) -> ANode r -> z
+anyNode f x = case x of
+  Left  n -> f n
+  Right n -> f n
 
 -- | Instances of 'DomNode' provide an interface to a tree of "nodes"
 -- which are either branching (of type 'El') or terminal (of type
@@ -78,24 +90,23 @@ class Monad r => DomNode r where
 
   -- | Returns the collection of child nodes of the given element.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.childNodes>
-  childNodes :: Node r El -> r [ANode r]
+  childNodes :: Node r El -> r (Seq (ANode r))
 
   -- | Returns the node's first child in the tree, or 'Nothing' if the
   -- node is childless.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.firstChild>
   firstChild :: Node r El -> r (Maybe (ANode r))
-  firstChild el = liftM safeHead (childNodes el) where
-    safeHead []    = Nothing
-    safeHead (x:_) = Just x
+  firstChild el = liftM (safeHead . Seq.viewl) (childNodes el) where
+    safeHead EmptyL   = Nothing
+    safeHead (x :< _) = Just x
 
   -- | lastChild returns the last child of a node, or 'Nothing' if the
   -- node is childless.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.lastChild>
   lastChild :: Node r El -> r (Maybe (ANode r))
-  lastChild el = liftM safeLast (childNodes el) where
-    safeLast []     = Nothing
-    safeLast [x]    = Just x
-    safeLast (_:xs) = safeLast xs
+  lastChild el = liftM (safeLast . Seq.viewr) (childNodes el) where
+    safeLast EmptyR   = Nothing
+    safeLast (_ :> x) = Just x
 
   -- | Returns the node immediately preceding the specified one in its
   -- parent's childNodes list, or 'Nothing' if the specified node is
@@ -109,10 +120,10 @@ class Monad r => DomNode r where
       Just p -> do
         cs  <- childNodes p
         cs' <- mapM (\c -> isEqualNode' (forgetNode n) c >>= \x -> return (c, not x)) cs
-        let t = takeWhile snd cs'
-        return $ case reverse t of
-          []        -> Nothing
-          ((x,_):_) -> Just x
+        let t = Seq.takeWhileL snd cs'
+        return $ case Seq.viewr t of
+          EmptyR     -> Nothing
+          _ :> (x,_) -> Just x
 
   -- | Returns the node immediately following the specified one in its
   -- parent's childNodes list, or 'Nothing' if the specified node is
@@ -126,10 +137,10 @@ class Monad r => DomNode r where
       Just p -> do
         cs  <- childNodes p
         cs' <- mapM (\c -> isEqualNode' (forgetNode n) c >>= \x -> return (c, not x)) cs
-        let t = dropWhile snd cs'
-        return $ case t of
-          []        -> Nothing
-          ((x,_):_) -> Just x
+        let t = Seq.takeWhileR snd cs'
+        return $ case Seq.viewl t of
+          EmptyL     -> Nothing
+          (x,_) :< _ -> Just x
 
   -- | Returns or sets the value of the current node. Compare this
   -- with 'children'.
@@ -213,7 +224,7 @@ class Monad r => DomNode r where
   -- | Returns whether a node has child nodes or not.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.hasChildNodes>
   hasChildNodes :: Node r El -> r Bool
-  hasChildNodes = liftM null . childNodes
+  hasChildNodes = liftM Seq.null . childNodes
 
   -- | Tests whether two nodes are (reference) equal.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.isEqualNode>
@@ -386,13 +397,13 @@ class DomEl r => DomView r where
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Element.scrollIntoView>
   scrollIntoView :: Node r El -> Position -> r ()
 
-childElements :: DomNode r => Node r El -> r [Node r El]
-childElements = liftM (mapMaybe goLeft) . childNodes where
+childElements :: DomNode r => Node r El -> r (Seq (Node r El))
+childElements = liftM (mapMaybeS goLeft) . childNodes where
   goLeft (Left a) = Just a
   goLeft _        = Nothing
 
-childTextNodes :: DomNode r => Node r El -> r [Node r Tx]
-childTextNodes = liftM (mapMaybe goRight) . childNodes where
+childTextNodes :: DomNode r => Node r El -> r (Seq (Node r Tx))
+childTextNodes = liftM (mapMaybeS goRight) . childNodes where
   goRight (Right a) = Just a
   goRight _         = Nothing
 
@@ -400,4 +411,10 @@ isEqualNode' :: (DomNode r, Monad r) => ANode r -> ANode r -> r Bool
 isEqualNode' (Left n1)  (Left n2)  = isEqualNode n1 n2
 isEqualNode' (Right n1) (Right n2) = isEqualNode n1 n2
 isEqualNode' _          _          = return False
+
+mapMaybeS :: (a -> Maybe b) -> Seq a -> Seq b
+mapMaybeS f = fmap fromJust . Seq.filter isJust . fmap f where
+  isJust (Just _)   = True
+  isJust _          = False
+  fromJust (Just a) = a
 

@@ -14,6 +14,8 @@ import           Data.IntMap.Strict   (IntMap)
 import qualified Data.IntMap.Strict   as IM
 import           Data.Maybe
 import           Data.Monoid
+import           Data.Sequence        (Seq, (|>))
+import qualified Data.Sequence        as Seq
 import           Data.STRef.Strict
 import           Data.Text            (Text)
 import           Data.Void
@@ -21,6 +23,10 @@ import           Web.Dom
 import qualified Web.Dom.Static       as Static
 import           Web.Dom.Types
 
+-- | The \"virtual\" DOM. Since the Dom interface provides access to,
+-- essentially, mutable references in the form of elements it's
+-- necessary for this virtual, pure representation to use an
+-- 'ST'-style thread-local phantom variable.
 newtype Virt s a =
   Virt {
     unVirt :: ReaderT (VNode s El) (ST s) a
@@ -35,7 +41,7 @@ mkTop = mfix go where
     VN <$> newSTRef (vnode top)
   vnode top =
     VirtNode {
-      here = Static.El (Static.Element "graveyard" mempty) [],
+      here = Static.El (Static.Element "" mempty) mempty,
       up   = top
       }
 
@@ -53,10 +59,7 @@ type  VNode s t =  Node (Virt s) t
 type AVNode s   = ANode (Virt s)
 
 liftST :: ST s a -> Virt s a
-liftST   = Virt . lift
-
-liftRead :: ReaderT (VNode s El) (ST s) a -> Virt s a
-liftRead = Virt
+liftST = Virt . lift
 
 instance DomNode (Virt s) where
   newtype Node (Virt s) ty = VN { theNode :: STRef s (VirtNode s) }
@@ -68,25 +71,60 @@ instance DomNode (Virt s) where
   nodeValue         = findTx
   isEqualNode a b   = return (a == b)
 
-  parentElement        = undefined
+  parentElement n = do
+    top <- ask
+    VirtNode { up = it }  <- liftST (readSTRef (theNode n))
+    return $ if it == top then Nothing else Just it
+
   appendChild          = undefined
   cloneNode            = undefined
 
   getElementsByTagName = undefined
   insertBefore         = undefined
-  
+
   deepCloneNode        = undefined
   removeChild          = undefined
   replaceChild         = undefined
 
--- | @link parent child@ puts @child@ as a child of @parent@ and
--- unlinks it from its previous parent.
+modifyVN :: (VirtNode s -> VirtNode s) -> VNode s ty -> Virt s ()
+modifyVN f n = liftST (modifySTRef (theNode n) f)
+
+getsVN :: (VirtNode s -> r) -> VNode s ty -> Virt s r
+getsVN f = liftM f . liftST . readSTRef . theNode
+
 link :: VNode s El -> AVNode s -> Virt s ()
-link = undefined
+link newParent = anyNode $ \child -> do
+
+  -- We need to:
+  --
+  -- 1. Set the child's parent-link to the new parent
+  -- 2. Remove the child from the old parent's child-list
+  -- 3. Merge the child into the new parent's childlist
+
+  -- (1)
+  modifyVN (\vn -> vn { up = newParent }) child
+
+  -- (2)
+  oldParent <- getsVN up child
+  modifyVN (\vn -> vn { here = elim child (here vn) }) oldParent
+
+  -- (3)
+  modifyVN (\vn ->
+             vn { here = let Static.El e cs = here vn
+                         in Static.El e (cs |> forgetNode child) })
+           newParent
+
+  where
+    elim :: INodeType a =>
+            VNode s a ->
+            Static.NodeF (AVNode s) ->
+            Static.NodeF (AVNode s)
+    elim c (Static.El e cs) = Static.El e (Seq.filter (/= forgetNode c) cs)
+
 
 fresh :: Static.NodeF Void -> Virt s (AVNode s)
 fresh n = do
-  top <- liftRead ask
+  top <- ask
   z <- liftST . newSTRef $
     VirtNode { here = fmap absurd n
              , up   = top
@@ -96,7 +134,7 @@ fresh n = do
     Static.Tx {} -> Right (VN z)
 
 freshEl :: Static.Element -> Virt s (VNode s El)
-freshEl e = fromLeft <$> fresh (Static.El e []) where
+freshEl e = fromLeft <$> fresh (Static.El e mempty) where
   fromLeft (Left a) = a
 
 freshTx :: Text -> Virt s (VNode s Tx)
@@ -107,14 +145,14 @@ findNode :: VNode s ty -> Virt s (Static.NodeF (AVNode s))
 findNode n = do
   vn <- (liftST . readSTRef . theNode) n
   return (here vn)
-      
-findEl :: VNode s El -> Virt s (Static.Element, [AVNode s])
+
+findEl :: VNode s El -> Virt s (Static.Element, Seq (AVNode s))
 findEl n = do
   vn <- findNode n
   case vn of
     Static.Tx {}   -> error "Virtual text node claiming to be an element"
     Static.El e cs -> return (e, cs)
-      
+
 findTx :: VNode s Tx -> Virt s Text
 findTx n = do
   vn <- findNode n
