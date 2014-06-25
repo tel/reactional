@@ -1,5 +1,4 @@
 {-# LANGUAGE DataKinds           #-}
-{-# LANGUAGE DefaultSignatures   #-}
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies        #-}
@@ -19,12 +18,13 @@ module Web.Dom (
   ) where
 
 import           Control.Applicative
+import           Control.Monad
 import           Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
-import           Data.Maybe (mapMaybe)
-import           Data.Text (Text)
-import qualified Data.Text as T
-import qualified Web.Dom.Static as Static
+import           Data.Maybe          (mapMaybe)
+import           Data.Text           (Text)
+import qualified Data.Text           as T
+import qualified Web.Dom.Static      as Static
 import           Web.Dom.Types
 
 {-
@@ -50,7 +50,7 @@ type ANode r = Either (Node r El) (Node r Tx)
 -- which are either branching (of type 'El') or terminal (of type
 -- 'Tx'). Little information is available beyond the ability to tag
 -- nodes, the text stored at terminal nodes,
-class Functor r => DomNode r where
+class Monad r => DomNode r where
 
   -- | The type of nodes inside the DOM. The final type index attempts
   -- to determine whether a given type is an element or a text node.
@@ -84,7 +84,7 @@ class Functor r => DomNode r where
   -- node is childless.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.firstChild>
   firstChild :: Node r El -> r (Maybe (ANode r))
-  firstChild el = safeHead <$> childNodes el where
+  firstChild el = liftM safeHead (childNodes el) where
     safeHead []    = Nothing
     safeHead (x:_) = Just x
 
@@ -92,7 +92,7 @@ class Functor r => DomNode r where
   -- node is childless.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.lastChild>
   lastChild :: Node r El -> r (Maybe (ANode r))
-  lastChild el = safeLast <$> childNodes el where
+  lastChild el = liftM safeLast (childNodes el) where
     safeLast []     = Nothing
     safeLast [x]    = Just x
     safeLast (_:xs) = safeLast xs
@@ -102,8 +102,6 @@ class Functor r => DomNode r where
   -- the first node in that list or has no parent.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.previousSibling>
   previousSibling :: INodeType a => Node r a -> r (Maybe (ANode r))
-  default previousSibling
-    :: (Monad r, INodeType a) => Node r a -> r (Maybe (ANode r))
   previousSibling n = do
     mp   <- parentElement n
     case mp of
@@ -121,8 +119,6 @@ class Functor r => DomNode r where
   -- the last node in that list.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.nextSibling>
   nextSibling :: INodeType a => Node r a -> r (Maybe (ANode r))
-  default nextSibling
-    :: (Monad r, INodeType a) => Node r a -> r (Maybe (ANode r))
   nextSibling n = do
     mp   <- parentElement n
     case mp of
@@ -171,13 +167,10 @@ class Functor r => DomNode r where
   -- > insertAfter parent reference target
   insertAfter :: (INodeType a, INodeType b) =>
                  Node r El -> Node r a -> Node r b -> r (Either String ())
-  default insertAfter
-    :: (Monad r, INodeType a, INodeType b) =>
-       Node r El -> Node r a -> Node r b -> r (Either String ())
   insertAfter parent reference target = do
     next <- nextSibling reference
     case next of
-      Nothing        -> appendChild parent target
+      Nothing        -> appendChild  parent   target
       Just (Left x)  -> insertBefore parent x target
       Just (Right x) -> insertBefore parent x target
 
@@ -192,13 +185,35 @@ class Functor r => DomNode r where
   deepCloneNode :: Node r El -> r (Node r El)
 
   -- | Indicates whether a node is a descendant of a given node.
+  -- Trivially, @contains e e@ holds. By default the algorithm is
+  -- @O(d)@ linear in the length of path from the parent to the child.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.contains>
-  contains :: Node r El -> Node r a -> r Bool
+  contains :: INodeType a => Node r El -> Node r a -> r Bool
+  contains parent child = case forgetNode child of
+    Right _ -> do
+      mp <- parentElement child
+      case mp of
+        Nothing -> return False
+        Just p  -> go p
+    Left  x -> go x
+
+    where
+      go :: Node r El -> r Bool
+      go c = do
+        done <- isEqualNode parent c
+        case done of
+          True  -> return True
+          False -> do
+            up <- parentElement c
+            case up of
+              Nothing -> return False -- We're at the top
+              Just p  -> contains parent p
+
 
   -- | Returns whether a node has child nodes or not.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.hasChildNodes>
   hasChildNodes :: Node r El -> r Bool
-  hasChildNodes = fmap null . childNodes
+  hasChildNodes = liftM null . childNodes
 
   -- | Tests whether two nodes are (reference) equal.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.isEqualNode>
@@ -270,7 +285,7 @@ class DomNode r => DomEl r where
   -- element has the specified attribute or not.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Element.hasAttribute>
   hasAttribute :: Node r El -> Attr -> r Bool
-  hasAttribute n a = HM.member a <$> attributes n
+  hasAttribute n a = liftM (HM.member a) (attributes n)
 
   -- | Removes an attribute from the specified element.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Element.removeAttribute>
@@ -286,7 +301,7 @@ class DomNode r => DomEl r where
   -- 'Nothing'.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/element.getAttribute>
   getAttribute :: Node r El -> Attr -> r (Maybe Text)
-  getAttribute n a = HM.lookup a <$> attributes n
+  getAttribute n a = liftM (HM.lookup a) (attributes n)
 
   -- NOTE: Eliminate this from the class? It ought to always be more
   -- efficient to work from the static structure. No need to overload.
@@ -372,12 +387,12 @@ class DomEl r => DomView r where
   scrollIntoView :: Node r El -> Position -> r ()
 
 childElements :: DomNode r => Node r El -> r [Node r El]
-childElements = fmap (mapMaybe goLeft) . childNodes where
+childElements = liftM (mapMaybe goLeft) . childNodes where
   goLeft (Left a) = Just a
   goLeft _        = Nothing
 
 childTextNodes :: DomNode r => Node r El -> r [Node r Tx]
-childTextNodes = fmap (mapMaybe goRight) . childNodes where
+childTextNodes = liftM (mapMaybe goRight) . childNodes where
   goRight (Right a) = Just a
   goRight _         = Nothing
 
