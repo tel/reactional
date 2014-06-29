@@ -131,6 +131,21 @@ instance DomNode (Virt s) where
       notFoundErrorMessage =
         "NotFoundError: Failed to execute 'removeChild' on 'Node': The node to be removed is not a child of this node."
 
+  getElementsByTagName (Just top) tg = lookupTag top where
+    lookupTag :: Node (Virt s) 'El -> Virt s (Seq (Node (Virt s) 'El))
+    lookupTag n = do
+      St.El (St.Element theTag attr) cs <- readHere n
+      found <- T.mapM lookupTag' cs
+      let found' = join found
+      if tg == theTag 
+        then return (n <| found')
+        else return found'
+      
+    lookupTag' :: ANode (Virt s) -> Virt s (Seq (Node (Virt s) 'El))
+    lookupTag' x = case x of
+      Left e  -> lookupTag e
+      Right t -> return mempty
+
 nodeEq :: (INodeType ty, INodeType ty')
         => Node (Virt s) ty -> Node (Virt s) ty' -> Bool
 nodeEq n1 n2 = forgetNode n1 == forgetNode n2

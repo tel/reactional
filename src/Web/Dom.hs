@@ -81,7 +81,7 @@ class Monad r => DomNode r where
   -- node is passed then it returns all tag-matched elements in the
   -- DOM.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/document.getElementsByClassName>
-  getElementsByTagName :: Maybe (Node r El) -> Tag -> r [Node r El]
+  getElementsByTagName :: Maybe (Node r El) -> Tag -> r (Seq (Node r El))
 
 
   -- /Node/ The node interface observes a tree of nodes and provides
