@@ -239,12 +239,19 @@ class Monad r => DomNode r where
   -- | Removes a child node from the DOM. Returns 'Left' if child not
   -- actually a child of the parent.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.removeChild>
-  removeChild :: Node r El -> Node r a -> r (Either String ())
+  removeChild :: INodeType a => Node r El -> Node r a -> r (Either String ())
 
   -- | Replaces one child node of the specified element with another.
+  --
+  -- > replaceChild parent reference child
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.removeChild>
-  replaceChild :: Node r El -> Node r a -> Node r b -> r (Either String ())
-
+  replaceChild :: (INodeType a, INodeType b)
+               => Node r El -> Node r a -> Node r b -> r (Either String ())
+  replaceChild p r c = do
+    x <- insertBefore p r c
+    case x of
+      Left err -> return (Left err)
+      Right ()  -> removeChild p r
 
 -- /Element/ The element interface is specific to nodes of type 'El'.
 -- It facilitates access to attributes and dressings related to the
