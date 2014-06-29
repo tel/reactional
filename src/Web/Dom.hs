@@ -23,7 +23,7 @@ import           Control.Applicative
 import           Control.Monad       hiding (mapM)
 import           Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
-import           Data.Maybe          (mapMaybe)
+import           Data.Maybe          (mapMaybe, isJust, fromJust)
 import           Data.Sequence       (Seq, ViewL (..), ViewR (..))
 import qualified Data.Sequence       as Seq
 import           Data.Text           (Text)
@@ -41,7 +41,7 @@ import           Web.Dom.Types
 
 -}
 
-data NodeType = El | Tx
+-- data NodeType = El | Tx
 
 class INodeType ty where
   forgetNode :: Node r ty -> ANode r
@@ -160,7 +160,7 @@ class Monad r => DomNode r where
   -- current parent node, then added to new parent node. If a cycle
   -- would be generated then this raises an error.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.appendChild>
-  appendChild :: Node r El -> Node r a -> r (Either String ())
+  appendChild :: INodeType a => Node r El -> Node r a -> r (Either String ())
 
   -- | Inserts the specified node before a reference element as a
   -- child of the current node. If a cycle would be generated then
@@ -168,7 +168,8 @@ class Monad r => DomNode r where
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.insertBefore>
   --
   -- > insertBefore parent reference target
-  insertBefore :: Node r El -> Node r a -> Node r b -> r (Either String ())
+  insertBefore :: (INodeType a, INodeType b) =>
+                  Node r El -> Node r a -> Node r b -> r (Either String ())
 
   -- | Inserts the specified node after a reference element as a child
   -- of the current node. If a cycle would be generated then this
@@ -186,14 +187,19 @@ class Monad r => DomNode r where
       Just (Right x) -> insertBefore parent x target
 
   -- | Returns a duplicate of the node on which this method was
-  -- called. Children are not copied.
+  -- called. Children are not copied—in fact the new node will have no
+  -- children. The duplicate node has no parent (parentNode is
+  -- 'Nothing') until it's added to the document, for example using
+  -- 'appendChild'.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.cloneNode>
   cloneNode :: INodeType a => Node r a -> r (Node r a)
 
   -- | Returns a duplicate of the node on which this method was
-  -- called. Children are copied as well.
+  -- called. Children are copied as well. The duplicate node has no
+  -- parent (parentNode is 'Nothing') until it's added to the
+  -- document, for example using 'appendChild'.
   -- <https://developer.mozilla.org/en-US/docs/Web/API/Node.cloneNode>
-  deepCloneNode :: Node r El -> r (Node r El)
+  deepCloneNode :: INodeType a => Node r a -> r (Node r a)
 
   -- | Indicates whether a node is a descendant of a given node.
   -- Trivially, @contains e e@ holds. By default the algorithm is
@@ -413,8 +419,4 @@ isEqualNode' (Right n1) (Right n2) = isEqualNode n1 n2
 isEqualNode' _          _          = return False
 
 mapMaybeS :: (a -> Maybe b) -> Seq a -> Seq b
-mapMaybeS f = fmap fromJust . Seq.filter isJust . fmap f where
-  isJust (Just _)   = True
-  isJust _          = False
-  fromJust (Just a) = a
-
+mapMaybeS f = fmap fromJust . Seq.filter isJust . fmap f

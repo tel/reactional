@@ -3,6 +3,8 @@ module Web.Dom.Types where
 
 import           Data.Text (Text)
 
+data NodeType = El | Tx
+
 -- | Type synonym for 'Text' which indicates a tag name.
 type Tag   = Text
 

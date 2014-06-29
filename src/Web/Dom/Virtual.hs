@@ -10,11 +10,12 @@ module Web.Dom.Virtual where
 import           Control.Applicative
 import           Control.Monad.Reader
 import           Control.Monad.ST
+import           Data.Either          (isRight)
 import           Data.IntMap.Strict   (IntMap)
 import qualified Data.IntMap.Strict   as IM
 import           Data.Maybe
 import           Data.Monoid
-import           Data.Sequence        (Seq, (|>))
+import           Data.Sequence        (Seq, (|>), (<|), ViewL (..))
 import qualified Data.Sequence        as Seq
 import           Data.STRef.Strict
 import           Data.Text            (Text)
@@ -27,13 +28,14 @@ import           Web.Dom.Types
 -- essentially, mutable references in the form of elements it's
 -- necessary for this virtual, pure representation to use an
 -- 'ST'-style thread-local phantom variable.
+--
+-- Notably, this threaded notion is pretty much inescapable just given
+-- the nature of the 'DomNode', 'DomEl', and 'DomView' APIs. They're
+-- fundamentally imperative.
 newtype Virt s a =
   Virt {
     unVirt :: ReaderT (VNode s El) (ST s) a
-  } deriving
-    ( Functor, Applicative, Monad
-    , MonadFix, MonadReader (Node (Virt s) El)
-    )
+  } deriving ( Functor, Applicative, Monad, MonadFix )
 
 mkTop :: ST s (VNode s El)
 mkTop = mfix go where
@@ -61,6 +63,9 @@ type AVNode s   = ANode (Virt s)
 liftST :: ST s a -> Virt s a
 liftST = Virt . lift
 
+vask :: Virt s (VNode s 'El)
+vask = Virt ask
+
 instance DomNode (Virt s) where
   newtype Node (Virt s) ty = VN { theNode :: STRef s (VirtNode s) }
     deriving ( Eq )
@@ -72,19 +77,84 @@ instance DomNode (Virt s) where
   isEqualNode a b   = return (a == b)
 
   parentElement n = do
-    top <- ask
+    top <- vask
     VirtNode { up = it }  <- liftST (readSTRef (theNode n))
     return $ if it == top then Nothing else Just it
 
-  appendChild          = undefined
-  cloneNode            = undefined
+  cloneNode n = do
+    vn  <- getsVN id n
+    top <- vask
+    let new = VirtNode { up   = top
+                       , here = case here vn of
+                           it@Static.Tx {} -> it
+                           Static.El e _   -> Static.El e mempty
+                       }
+    VN <$> liftST (newSTRef new)
+
+  appendChild parent child = do
+    x <- cycles child parent
+    when (isRight x) (link (|>) parent (forgetNode child))
+    return x
+
+  insertBefore parent ref child = do
+    x <- cycles child parent
+    when (isRight x) $
+      link (addBefore (forgetNode ref))
+           parent
+           (forgetNode child)
+    return x
+    where
+      addBefore :: AVNode s -> Seq (AVNode s) -> AVNode s -> Seq (AVNode s)
+      addBefore ref all new =
+        let (l, c, r) = smashl (== ref) all
+        in case c of
+          Nothing -> l |> new
+          Just x  -> l <> (new <| x <| r)
+
+  insertAfter parent ref child = do
+    x <- cycles child parent
+    when (isRight x) $
+      link (addAfter (forgetNode ref))
+           parent
+           (forgetNode child)
+    return x
+    where
+      addAfter :: AVNode s -> Seq (AVNode s) -> AVNode s -> Seq (AVNode s)
+      addAfter ref all new =
+        let (l, c, r) = smashl (== ref) all
+        in case c of
+          Nothing -> l |> new
+          Just x  -> l <> (x <| new <| r)
 
   getElementsByTagName = undefined
-  insertBefore         = undefined
 
-  deepCloneNode        = undefined
+  deepCloneNode n = do
+    vn  <- getsVN id n
+    vn' <- case vn of
+      Static.Tx {}   -> return vn
+      Static.El e cs -> do
+        Static.El e <$> mapM (anyNode $ liftM forgetNode . deepCloneNode) cs
+    ref <- liftST (newSTRef vn')
+    return (VN ref)
+   
   removeChild          = undefined
   replaceChild         = undefined
+
+smashl :: (a -> Bool) -> Seq a -> (Seq a, Maybe a, Seq a)
+smashl at seq =
+  let (l, r) = Seq.breakl at seq
+  in case Seq.viewl r of
+    EmptyL -> (l, Nothing, r)
+    a :< s -> (l, Just a, s)
+
+cycles :: (INodeType a, DomNode m) => Node m a -> Node m 'El -> m (Either String ())
+cycles parent child = do
+  case forgetNode child of
+    Right tx -> return (Right ())
+    Left  el -> do
+      x <- contains child parent
+      if x then return (Left "Cycle detected") else return (Right ())
+
 
 modifyVN :: (VirtNode s -> VirtNode s) -> VNode s ty -> Virt s ()
 modifyVN f n = liftST (modifySTRef (theNode n) f)
@@ -92,8 +162,9 @@ modifyVN f n = liftST (modifySTRef (theNode n) f)
 getsVN :: (VirtNode s -> r) -> VNode s ty -> Virt s r
 getsVN f = liftM f . liftST . readSTRef . theNode
 
-link :: VNode s El -> AVNode s -> Virt s ()
-link newParent = anyNode $ \child -> do
+link :: (Seq (AVNode s) -> ANode (Virt s) -> Seq (AVNode s)) ->
+        VNode s El -> AVNode s -> Virt s ()
+link f newParent = anyNode $ \child -> do
 
   -- We need to:
   --
@@ -111,7 +182,7 @@ link newParent = anyNode $ \child -> do
   -- (3)
   modifyVN (\vn ->
              vn { here = let Static.El e cs = here vn
-                         in Static.El e (cs |> forgetNode child) })
+                         in Static.El e (f cs (forgetNode child)) })
            newParent
 
   where
@@ -124,7 +195,7 @@ link newParent = anyNode $ \child -> do
 
 fresh :: Static.NodeF Void -> Virt s (AVNode s)
 fresh n = do
-  top <- ask
+  top <- vask
   z <- liftST . newSTRef $
     VirtNode { here = fmap absurd n
              , up   = top
